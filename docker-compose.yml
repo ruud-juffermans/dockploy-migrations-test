@@ -1,0 +1,23 @@
+services:
+  migrate:
+    build: .
+    environment:
+      FLYWAY_URL: jdbc:postgresql://db:5432/appdb
+      FLYWAY_USER: appuser
+      FLYWAY_PASSWORD: apppass
+      FLYWAY_CONNECT_RETRIES: 30
+      FLYWAY_VALIDATE_ON_MIGRATE: "true"
+      FLYWAY_STAY_RUNNING: "true"
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: appdb
+      PGUSER: appuser
+      PGPASSWORD: apppass
+    networks:
+      - app-network
+    restart: "no"
+
+networks:
+  app-network:
+    external: true
+    name: app_app-network
