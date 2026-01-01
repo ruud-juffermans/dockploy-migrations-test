@@ -1,0 +1,119 @@
+name: CI (Docker build + Flyway + SQL checks)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: appdb
+          POSTGRES_USER: appuser
+          POSTGRES_PASSWORD: apppass
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U appuser -d appdb"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show repo structure (debug)
+        run: |
+          ls -la
+          echo "migrations:" && (ls -la migrations || true)
+          echo "ops:" && (ls -la ops || true)
+          echo "seeds:" && (ls -la seeds || true)
+          echo "tools:" && (ls -la tools || true)
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build migrations image
+        run: |
+          docker build -t migrations-ci:local .
+
+      - name: Wait for Postgres to be healthy
+        run: |
+          for i in {1..60}; do
+            if docker exec "${{ job.services.postgres.id }}" pg_isready -U appuser -d appdb; then
+              echo "Postgres is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Postgres did not become ready in time"
+          exit 1
+
+      # -------------------------
+      # Flyway: validate + migrate
+      # -------------------------
+      - name: Flyway validate (migrations)
+        run: |
+          docker run --rm --network host \
+            -e FLYWAY_URL="jdbc:postgresql://127.0.0.1:5432/appdb" \
+            -e FLYWAY_USER="appuser" \
+            -e FLYWAY_PASSWORD="apppass" \
+            migrations-ci:local \
+            sh -lc 'flyway -configFiles=/flyway/conf/flyway.conf validate'
+
+      - name: Flyway migrate (migrations)
+        run: |
+          docker run --rm --network host \
+            -e FLYWAY_URL="jdbc:postgresql://127.0.0.1:5432/appdb" \
+            -e FLYWAY_USER="appuser" \
+            -e FLYWAY_PASSWORD="apppass" \
+            migrations-ci:local \
+            sh -lc 'flyway -configFiles=/flyway/conf/flyway.conf migrate'
+
+      # -------------------------
+      # Optional: execute ops + seeds SQL to catch syntax errors
+      # NOTE: This executes SQL. Keep scripts safe for CI.
+      # -------------------------
+      - name: SQL checks (ops + seeds) via psql
+        run: |
+          set -euo pipefail
+
+          # Run psql from inside the built image (you installed postgresql-client there)
+          # Uses --network host so container can reach 127.0.0.1:5432
+          run_psql () {
+            local file="$1"
+            echo "Running: $file"
+            docker run --rm --network host \
+              -e PGPASSWORD="apppass" \
+              migrations-ci:local \
+              sh -lc "psql -h 127.0.0.1 -p 5432 -U appuser -d appdb -v ON_ERROR_STOP=1 -X -f \"$file\""
+          }
+
+          # Seeds (typically safe)
+          if [ -d "seeds" ]; then
+            # Run every .sql under seeds/
+            while IFS= read -r -d '' f; do
+              run_psql "$f"
+            done < <(find seeds -type f -name "*.sql" -print0)
+          fi
+
+          # Ops: run only “safe” categories by default.
+          # Skip vacuum/reindex concurrently scripts unless you explicitly want them in CI.
+          if [ -d "ops" ]; then
+            while IFS= read -r -d '' f; do
+              case "$f" in
+                *vacuum*|*reindex*concurrently*|*REINDEX*CONCURRENTLY*)
+                  echo "Skipping (non-transactional/maintenance): $f"
+                  ;;
+                *)
+                  run_psql "$f"
+                  ;;
+              esac
+            done < <(find ops -type f -name "*.sql" -print0)
+          fi
